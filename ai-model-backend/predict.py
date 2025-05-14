@@ -233,6 +233,7 @@ def is_ambiguous(output: np.ndarray, threshold: float = 0.15) -> bool:
 
 def classify_image(image_bytes: bytes) -> dict:
     try:
+        # Step 1: Preprocess and predict
         input_data = preprocess(image_bytes)
         interpreter.set_tensor(input_details[0]['index'], input_data)
         interpreter.invoke()
@@ -245,47 +246,52 @@ def classify_image(image_bytes: bytes) -> dict:
         print(f"Predicted label: {label}")
         print(f"Confidence: {confidence:.4f}")
 
-        if label == "none":
+
+        if label == "none-accident":
             return {
-                "label": None,
+                "label": label,
                 "confidence": round(confidence, 4),
                 "status": "invalid",
                 "action": "reject",
                 "reason": "Image does not indicate a fire or road incident."
             }
-
+        # Step 2: Check if the photo is likely fake
         if is_likely_fake_photo(image_bytes):
             return {
                 "label": label,
                 "confidence": round(confidence, 4),
                 "status": "invalid",
                 "action": "reject",
-                "reason": "Detected as a photo of a photo or fake"
+                "reason": "Detected as a photo of a photo or manipulated"
             }
 
+        # Step 3: Reject if prediction is ambiguous
         if is_ambiguous(output, threshold=0.15):
             return {
-                "label": None,
+                "label": "none-accident",
                 "confidence": round(confidence, 4),
                 "status": "invalid",
                 "action": "reject",
-                "reason": "Prediction is ambiguous — no clear label"
+                "reason": "Unsure result — needs human review"
             }
 
+        # Step 4: Reject if confidence is too low
         if confidence < 0.75:
             return {
                 "label": label,
                 "confidence": round(confidence, 4),
                 "status": "invalid",
                 "action": "reject",
-                "reason": "Low confidence"
+                "reason": "Invalid image - undertiminable"
             }
 
+        # Step 5: Valid prediction (can be fire, road, or none-accident)
         return {
             "label": label,
             "confidence": round(confidence, 4),
             "status": "valid",
-            "action": "accept"
+            "action": "accept",
+            "reason": "Valid"
         }
 
     except Exception as e:
@@ -294,5 +300,6 @@ def classify_image(image_bytes: bytes) -> dict:
             "label": None,
             "confidence": 0,
             "status": "error",
-            "action": "reject"
+            "action": "reject",
+            "reason": "Invalid Image"
         }

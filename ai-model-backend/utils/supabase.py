@@ -32,7 +32,7 @@ def download_images():
     metadata = {} if force_all else load_metadata()
     new_metadata = {}
 
-    folders = ["road", "fire", "none"]
+    folders = ["road", "fire", "none-accident"]
 
     if force_all:
         print("⚠️  Local training data missing or empty. Re-downloading all images...")
