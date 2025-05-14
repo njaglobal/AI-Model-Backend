@@ -16,5 +16,5 @@ def train_endpoint():
 @app.post("/predict")
 async def predict_endpoint(file: UploadFile = File(...)):
     contents = await file.read()
-    label = classify_image(contents)
-    return {"prediction": label}
+    result = classify_image(contents)
+    return result  # 🔥 Return the full dict directly

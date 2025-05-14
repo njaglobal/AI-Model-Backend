@@ -20,18 +20,43 @@ output_details = interpreter.get_output_details()
 def preprocess(image_bytes: bytes) -> np.ndarray:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     img = img.resize(IMG_SIZE)
-    img = np.array(img, dtype=np.float32) / 255.0  # normalize
-    return np.expand_dims(img, axis=0)  # add batch dim
+    img = np.array(img, dtype=np.float32) / 255.0
+    return np.expand_dims(img, axis=0)
 
-def classify_image(image_bytes: bytes) -> str:
+def classify_image(image_bytes: bytes) -> dict:
     try:
         input_data = preprocess(image_bytes)
         interpreter.set_tensor(input_details[0]['index'], input_data)
         interpreter.invoke()
         output = interpreter.get_tensor(output_details[0]['index'])
+
         predicted_idx = int(np.argmax(output))
         confidence = float(np.max(output))
         label = class_labels[predicted_idx]
-        return f"{label} ({confidence:.2f})"
+
+        # Classify based on confidence
+        if confidence >= 0.85:
+            status = "valid"
+            action = "accept"
+        elif 0.60 <= confidence < 0.85:
+            status = "moderate"
+            action = "ask"
+        else:
+            status = "invalid"
+            action = "reject"
+
+        return {
+            "label": label,
+            "confidence": round(confidence, 4),
+            "status": status,       # "valid", "moderate", or "invalid"
+            "action": action        # "accept", "ask", or "reject"
+        }
+
     except Exception as e:
-        return f"error: {str(e)}"
+        return {
+            "error": str(e),
+            "label": None,
+            "confidence": 0,
+            "status": "error",
+            "action": "reject"
+        }
