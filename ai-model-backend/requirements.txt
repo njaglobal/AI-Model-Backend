@@ -7,3 +7,5 @@ tensorflow
 python-dotenv
 requests
 scikit-learn
+exif
+opencv-python-headless
