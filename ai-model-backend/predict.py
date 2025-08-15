@@ -166,6 +166,145 @@
 #             "action": "reject"
 #         }
 
+#<<-------------------------------------- running code ---------------------------------------->
+# import tensorflow as tf
+# import numpy as np
+# from PIL import Image
+# import io
+# import cv2
+# from exif import Image as ExifImage
+
+# MODEL_PATH = "models/model.tflite"
+# LABELS_PATH = "models/labels.txt"
+# IMG_SIZE = (224, 224)
+
+# # Load class labels
+# with open(LABELS_PATH, "r") as f:
+#     class_labels = [line.strip() for line in f.readlines()]
+
+# # Load TFLite model
+# interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+# interpreter.allocate_tensors()
+# input_details = interpreter.get_input_details()
+# output_details = interpreter.get_output_details()
+
+# def preprocess(image_bytes: bytes) -> np.ndarray:
+#     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+#     img = img.resize(IMG_SIZE)
+#     img = np.array(img, dtype=np.float32) / 255.0
+#     return np.expand_dims(img, axis=0)
+
+# def is_likely_fake_photo(image_bytes: bytes) -> bool:
+#     exif_checked = False
+#     blur_checked = False
+#     is_fake = False
+
+#     try:
+#         exif = ExifImage(io.BytesIO(image_bytes))
+#         camera_make = getattr(exif, "make", "").lower()
+#         camera_model = getattr(exif, "model", "").lower()
+#         if any(k in camera_make for k in ["apple", "samsung", "xiaomi", "oppo", "vivo", "huawei", "google"]) or \
+#            any(k in camera_model for k in ["iphone", "galaxy", "pixel", "redmi", "android"]):
+#             is_fake = True
+#         exif_checked = True
+#     except Exception as e:
+#         print("EXIF check failed:", e)
+
+#     try:
+#         pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+#         np_img = np.array(pil_img)
+#         gray = cv2.cvtColor(np_img, cv2.COLOR_RGB2GRAY)
+#         laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+#         if laplacian_var < 50:
+#             is_fake = True
+#         blur_checked = True
+#     except Exception as e:
+#         print("Blurriness check failed:", e)
+
+#     if not exif_checked and not blur_checked:
+#         print("⚠️ Both checks failed. Defaulting to fake.")
+#         return True
+
+#     return is_fake
+
+# def is_ambiguous(output: np.ndarray, threshold: float = 0.15) -> bool:
+#     sorted_probs = np.sort(output[0])
+#     return (sorted_probs[-1] - sorted_probs[-2]) < threshold
+
+# def classify_image(image_bytes: bytes) -> dict:
+#     try:
+#         # Step 1: Preprocess and predict
+#         input_data = preprocess(image_bytes)
+#         interpreter.set_tensor(input_details[0]['index'], input_data)
+#         interpreter.invoke()
+#         output = interpreter.get_tensor(output_details[0]['index'])
+
+#         predicted_idx = int(np.argmax(output))
+#         confidence = float(np.max(output))
+#         label = class_labels[predicted_idx]
+
+#         print(f"Predicted label: {label}")
+#         print(f"Confidence: {confidence:.4f}")
+
+
+#         if label == "none-accident":
+#             return {
+#                 "label": label,
+#                 "confidence": round(confidence, 4),
+#                 "status": "invalid",
+#                 "action": "reject",
+#                 "reason": "Image does not indicate a fire or road incident."
+#             }
+#         # Step 2: Check if the photo is likely fake
+#         if is_likely_fake_photo(image_bytes):
+#             return {
+#                 "label": label,
+#                 "confidence": round(confidence, 4),
+#                 "status": "invalid",
+#                 "action": "reject",
+#                 "reason": "Detected as a photo of a photo or manipulated"
+#             }
+
+#         # Step 3: Reject if prediction is ambiguous
+#         if is_ambiguous(output, threshold=0.15):
+#             return {
+#                 "label": "none-accident",
+#                 "confidence": round(confidence, 4),
+#                 "status": "invalid",
+#                 "action": "reject",
+#                 "reason": "Unsure result — needs human review"
+#             }
+
+#         # Step 4: Reject if confidence is too low
+#         if confidence < 0.75:
+#             return {
+#                 "label": label,
+#                 "confidence": round(confidence, 4),
+#                 "status": "invalid",
+#                 "action": "reject",
+#                 "reason": "Invalid image - undertiminable"
+#             }
+
+#         # Step 5: Valid prediction (can be fire, road, or none-accident)
+#         return {
+#             "label": label,
+#             "confidence": round(confidence, 4),
+#             "status": "valid",
+#             "action": "accept",
+#             "reason": "Valid"
+#         }
+
+#     except Exception as e:
+#         return {
+#             "error": str(e),
+#             "label": None,
+#             "confidence": 0,
+#             "status": "error",
+#             "action": "reject",
+#             "reason": "Invalid Image"
+#         }
+
+
 
 import tensorflow as tf
 import numpy as np
@@ -173,28 +312,56 @@ from PIL import Image
 import io
 import cv2
 from exif import Image as ExifImage
+import os
 
 MODEL_PATH = "models/model.tflite"
 LABELS_PATH = "models/labels.txt"
 IMG_SIZE = (224, 224)
 
-# Load class labels
-with open(LABELS_PATH, "r") as f:
-    class_labels = [line.strip() for line in f.readlines()]
+def load_model_and_labels():
+    """Load the ResNet50-based TFLite model and class labels."""
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
+    
+    if not os.path.exists(LABELS_PATH):
+        raise FileNotFoundError(f"Labels file not found: {LABELS_PATH}")
+    
+    # Load class labels
+    with open(LABELS_PATH, "r") as f:
+        class_labels = [line.strip() for line in f.readlines()]
+    
+    # Load TFLite model (ResNet50-based)
+    interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+    interpreter.allocate_tensors()
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    
+    return interpreter, input_details, output_details, class_labels
 
-# Load TFLite model
-interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
-interpreter.allocate_tensors()
-input_details = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
+# Initialize model components
+try:
+    interpreter, input_details, output_details, class_labels = load_model_and_labels()
+    print(f"✅ ResNet50-based model loaded successfully")
+    print(f"📋 Available classes: {class_labels}")
+except Exception as e:
+    print(f"❌ Error loading model: {e}")
+    interpreter = input_details = output_details = class_labels = None
 
 def preprocess(image_bytes: bytes) -> np.ndarray:
+    """
+    Preprocess image for ResNet50 model inference.
+    ResNet50 expects input shape (224, 224, 3) with values normalized to [0, 1].
+    """
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     img = img.resize(IMG_SIZE)
-    img = np.array(img, dtype=np.float32) / 255.0
+    img = np.array(img, dtype=np.float32) / 255.0  # Normalize to [0, 1]
     return np.expand_dims(img, axis=0)
 
 def is_likely_fake_photo(image_bytes: bytes) -> bool:
+    """
+    Detect if an image is likely a photo of a photo or manipulated.
+    Uses EXIF data analysis and blur detection.
+    """
     exif_checked = False
     blur_checked = False
     is_fake = False
@@ -228,12 +395,34 @@ def is_likely_fake_photo(image_bytes: bytes) -> bool:
     return is_fake
 
 def is_ambiguous(output: np.ndarray, threshold: float = 0.15) -> bool:
+    """
+    Check if the prediction is ambiguous based on confidence difference.
+    """
     sorted_probs = np.sort(output[0])
     return (sorted_probs[-1] - sorted_probs[-2]) < threshold
 
 def classify_image(image_bytes: bytes) -> dict:
+    """
+    Classify image using the ResNet50-based TFLite model.
+    
+    Args:
+        image_bytes: Raw image bytes
+        
+    Returns:
+        dict: Classification result with label, confidence, status, action, and reason
+    """
+    if interpreter is None:
+        return {
+            "error": "Model not loaded",
+            "label": None,
+            "confidence": 0,
+            "status": "error",
+            "action": "reject",
+            "reason": "ResNet50 model failed to load"
+        }
+    
     try:
-        # Step 1: Preprocess and predict
+        # Step 1: Preprocess and predict with ResNet50
         input_data = preprocess(image_bytes)
         interpreter.set_tensor(input_details[0]['index'], input_data)
         interpreter.invoke()
@@ -243,10 +432,10 @@ def classify_image(image_bytes: bytes) -> dict:
         confidence = float(np.max(output))
         label = class_labels[predicted_idx]
 
-        print(f"Predicted label: {label}")
+        print(f"ResNet50 Predicted label: {label}")
         print(f"Confidence: {confidence:.4f}")
 
-
+        # Step 2: Handle "none-accident" classification
         if label == "none-accident":
             return {
                 "label": label,
@@ -255,7 +444,8 @@ def classify_image(image_bytes: bytes) -> dict:
                 "action": "reject",
                 "reason": "Image does not indicate a fire or road incident."
             }
-        # Step 2: Check if the photo is likely fake
+        
+        # Step 3: Check if the photo is likely fake
         if is_likely_fake_photo(image_bytes):
             return {
                 "label": label,
@@ -265,7 +455,7 @@ def classify_image(image_bytes: bytes) -> dict:
                 "reason": "Detected as a photo of a photo or manipulated"
             }
 
-        # Step 3: Reject if prediction is ambiguous
+        # Step 4: Reject if prediction is ambiguous
         if is_ambiguous(output, threshold=0.15):
             return {
                 "label": "none-accident",
@@ -275,7 +465,7 @@ def classify_image(image_bytes: bytes) -> dict:
                 "reason": "Unsure result — needs human review"
             }
 
-        # Step 4: Reject if confidence is too low
+        # Step 5: Reject if confidence is too low
         if confidence < 0.75:
             return {
                 "label": label,
@@ -285,7 +475,7 @@ def classify_image(image_bytes: bytes) -> dict:
                 "reason": "Invalid image - undertiminable"
             }
 
-        # Step 5: Valid prediction (can be fire, road, or none-accident)
+        # Step 6: Valid prediction (can be fire, road, or none-accident)
         return {
             "label": label,
             "confidence": round(confidence, 4),
