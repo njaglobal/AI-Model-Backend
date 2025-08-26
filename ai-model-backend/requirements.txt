@@ -10,3 +10,4 @@ scikit-learn
 exif
 opencv-python-headless
 supabase
+matplotlib

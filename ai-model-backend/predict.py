@@ -314,8 +314,9 @@ import cv2
 from exif import Image as ExifImage
 import os
 
-MODEL_PATH = "models/model.tflite"
-LABELS_PATH = "models/labels.txt"
+# MODEL_PATH = "models/model.tflite"
+MODEL_PATH = "models/final_model.tflite"
+LABELS_PATH = "models/labels_full.txt"
 IMG_SIZE = (224, 224)
 
 def load_model_and_labels():

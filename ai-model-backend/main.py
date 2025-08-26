@@ -27,3 +27,6 @@ async def predict_endpoint(file: UploadFile = File(...)):
     contents = await file.read()
     result = classify_image(contents)
     return result  # 🔥 Return the full dict directly
+
+
+

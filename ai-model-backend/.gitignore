@@ -1,0 +1,104 @@
+# ----------------
+# Python
+# ----------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# ----------------
+# Logs / debug
+# ----------------
+*.log
+*.out
+*.err
+
+# ----------------
+# TensorFlow / Keras
+# ----------------
+# Checkpoints
+*.ckpt
+*.ckpt.*
+checkpoint
+
+# TensorBoard
+logs/
+logs/*
+
+# ----------------
+# Models (large files)
+# ----------------
+# Prevent committing trained models
+*.h5
+*.hdf5
+*.tflite
+*.pb
+*.onnx
+
+# Local models directory
+ai-model-backend/models/
+ai-model-backend/training_data/
+
+# ----------------
+# Data
+# ----------------
+# Ignore raw datasets
+training_data/
+datasets/
+*.csv
+*.tsv
+*.parquet
+*.zip
+*.tar.gz
+
+# ----------------
+# OS / IDE files
+# ----------------
+# Mac
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# VSCode / PyCharm
+.vscode/
+.idea/
+
+# ----------------
+# Build / Packaging
+# ----------------
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+sdist/
+var/
+*.manifest
+*.spec
+
+# ----------------
+# Unit test / coverage
+# ----------------
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+cover/
