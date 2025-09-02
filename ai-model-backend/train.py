@@ -1,6 +1,8 @@
 # train.py (ResNet50 teacher + MobileNetV2 student)
 
 import os
+import gzip
+import json
 import random
 import shutil
 import hashlib
@@ -16,7 +18,7 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, Callback
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, precision_recall_fscore_support
-from utils.supabase import download_images  # Must return List[str] of new local files
+from utils.supabase import download_images, METADATA_FILE, supabase
 
 # ========= Reproducibility =========
 RANDOM_SEED = 42
@@ -34,10 +36,12 @@ EPOCHS = 20
 FINE_TUNE_EPOCHS = 10
 FINE_TUNE_AT = 100
 HASH_PATH = os.path.join(MODEL_DIR, "dataset.hash")
+BEST_PATH = os.path.join(MODEL_DIR, "best_student.h5")
 LABELS_PATH = os.path.join(MODEL_DIR, "labels.txt")
 TEACHER_MODEL_PATH = os.path.join(MODEL_DIR, "teacher_model.h5")
 FINAL_MODEL_PATH = os.path.join(MODEL_DIR, "final_model.h5")
 PER_CLASS_CSV = os.path.join(MODEL_DIR, "per_class_metrics.csv")
+BUCKET_NAME = "models"
 
 # ======== Distillation =========
 USE_DISTILLATION = True
@@ -73,6 +77,276 @@ MODERATE_AUG_PARAMS = dict(
     fill_mode="nearest"
 )
 
+
+# ========= Supabase Helpers =========
+def download_models():
+   
+    for model_file in ["dataset.hash", "labels_full.txt" ]:
+        # Use .gz for .h5 files
+        remote_file = f"{model_file}.gz" if model_file.endswith(".h5") else model_file
+        local_path = os.path.join(MODEL_DIR, remote_file)
+        try:
+            content = supabase.storage.from_(BUCKET_NAME).download(f"models/{remote_file}")
+            with open(local_path, "wb") as f:
+                f.write(content)
+            
+            # Decompress if .gz
+            if local_path.endswith(".gz"):
+                decompressed_path = local_path[:-3]  # remove .gz
+                with gzip.open(local_path, "rb") as f_in, open(decompressed_path, "wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+                os.remove(local_path)  # remove compressed file
+                print(f"✅ Downloaded and decompressed {model_file}")
+            else:
+                print(f"✅ Downloaded {model_file}")
+        except Exception as e:
+            print(f"⚠️ {model_file} not found in Supabase! Creating new file {model_file}")
+
+# def download_images_from_metadata():
+#     """
+#     Syncs images from Supabase for incremental or cold-start training.
+#     Returns:
+#         new_files: list of newly downloaded files (for incremental)
+#         metadata_exists: True if metadata.json exists in Supabase
+#     """
+#     print("🔍 Checking Supabase for metadata.json...")
+
+#     # Ensure main data directory exists
+#     os.makedirs(DATA_DIR, exist_ok=True)
+
+#     metadata_exists = False
+#     new_files = []
+
+#     # Attempt to download _downloaded_metadata.json
+#     try:
+#         content = supabase.storage.from_(BUCKET_NAME).download("_downloaded_metadata.json")
+#         metadata = json.loads(content)
+#         metadata_exists = True
+#         print(f"✅ Found metadata.json with {len(metadata)} entries")
+#     except Exception:
+#         print("⚠️ metadata.json not found in Supabase. Proceeding with cold start.")
+#         metadata = {}
+
+#     # If metadata exists, download only new/updated images
+#     if metadata_exists:
+#         for key, size in metadata.items():
+#             folder, name = key.split("/", 1)
+#             dest_dir = os.path.join(DATA_DIR, folder)
+#             os.makedirs(dest_dir, exist_ok=True)
+#             local_path = os.path.join(dest_dir, name)
+
+#             # Skip unchanged files
+#             if os.path.exists(local_path) and os.path.getsize(local_path) == size:
+#                 continue
+
+#             try:
+#                 file_content = supabase.storage.from_(BUCKET_NAME).download(key)
+#                 with open(local_path, "wb") as f:
+#                     f.write(file_content)
+#                 new_files.append(local_path)
+#             except Exception as e:
+#                 print(f"❌ Failed to download {key}: {e}")
+
+#         print(f"✅ Downloaded {len(new_files)} new/updated files based on metadata")
+
+#     # If metadata does not exist, download all images (cold start)
+#     else:
+#        new_files = download_images()
+
+#     return new_files, metadata_exists
+
+# def upload_compressed_h5(local_path, remote_path):
+#     compressed_path = local_path + ".gz"
+#     with open(local_path, "rb") as f_in, gzip.open(compressed_path, "wb") as f_out:
+#         shutil.copyfileobj(f_in, f_out)
+
+#     safe_upload(BUCKET_NAME, remote_path + ".gz", compressed_path)
+#     print(f"✅ Uploaded compressed {remote_path}.gz")
+
+# def download_and_decompress_h5(remote_path, local_path):
+#     compressed_path = local_path + ".gz"
+#     # Download from Supabase
+#     content = supabase.storage.from_(BUCKET_NAME).download(remote_path + ".gz")
+#     with open(compressed_path, "wb") as f:
+#         f.write(content)
+#     # Decompress
+#     with gzip.open(compressed_path, "rb") as f_in, open(local_path, "wb") as f_out:
+#         shutil.copyfileobj(f_in, f_out)
+#     print(f"✅ Decompressed {local_path} ready for training")
+
+
+def log_model_metadata(version: int, model_path:str, accuracy: float, class_metrics: dict):
+    """Insert model metadata into Supabase table 'models'."""
+    try:
+        supabase.table("models").insert({
+        "version": version,
+        "model_path": model_path,
+        "accuracy": accuracy,
+        "per_class_metrics": class_metrics
+        }).execute()
+        print(f"📝 Logged metadata for {version} (acc={accuracy:.4f})")
+    except Exception as e:
+        print(f"❌ Failed to log metadata: {e}")
+
+
+def safe_upload(bucket, path, file_path, content_type="application/octet-stream"):
+    """Remove file if exists, then upload fresh."""
+    try:
+        supabase.storage.from_(bucket).remove([path])
+    except Exception:
+        pass  # Ignore if missing
+    with open(file_path, "rb") as f:
+        return supabase.storage.from_(bucket).upload(
+            path, f, {"content-type": content_type}
+        )
+
+def upload_model_and_labels(student_acc, class_metrics):
+    """
+    Upload labels, dataset.hash, TFLite model, and compressed H5 models to Supabase with versioning and cleanup.
+    """
+    next_version = None
+    versioned_name = None
+
+    try:
+
+        # ---------------- Upload JSON Metadata ----------------
+        if os.path.exists(METADATA_FILE):
+            with open(METADATA_FILE, "r") as f:
+                metadata = json.load(f)
+            safe_upload(BUCKET_NAME, "_downloaded_metadata.json", METADATA_FILE, content_type="application/json")
+            print(f"🗂️ Updated _downloaded_metadata.json in Supabase with {len(metadata)} entries")
+        # ---------------- Upload labels ----------------
+        for labels_file in ["labels_full.txt"]:
+            path = os.path.join(MODEL_DIR, labels_file)
+            if os.path.exists(path):
+                safe_upload(BUCKET_NAME, f"models/{labels_file}", path, content_type="text/plain")
+                print(f"✅ Uploaded {labels_file}")
+
+        # ---------------- Upload dataset.hash ----------------
+        if os.path.exists(HASH_PATH):
+            safe_upload(BUCKET_NAME, "models/dataset.hash", HASH_PATH, content_type="text/plain")
+            print("✅ Uploaded dataset.hash")
+
+        # ---------------- Upload compressed H5 models ----------------
+        # for model_file in ["teacher_model.h5", "final_model.h5"]:
+        #     path = os.path.join(MODEL_DIR, model_file)
+        #     if os.path.exists(path):
+        #         compressed_path = path + ".gz"
+        #         # Compress the .h5 file
+        #         with open(path, "rb") as f_in, gzip.open(compressed_path, "wb") as f_out:
+        #             shutil.copyfileobj(f_in, f_out)
+        #         # Upload compressed file
+        #         safe_upload(BUCKET_NAME, f"models/{model_file}.gz", compressed_path, content_type="application/gzip")
+        #         print(f"✅ Uploaded {model_file} as {model_file}.gz")
+        #         os.remove(compressed_path)
+
+        # ---------------- Upload TFLite model with versioning ----------------
+        tflite_path = os.path.join(MODEL_DIR, "final_model.tflite")
+        if os.path.exists(tflite_path):
+            existing = supabase.storage.from_(BUCKET_NAME).list("models")
+            versions = [f["name"] for f in existing if f["name"].startswith("final_model_v")]
+            next_version = len(versions) + 1
+
+            versioned_name = f"final_model_v{next_version}.tflite"
+            latest_name = "final_model_latest.tflite"
+
+            safe_upload(BUCKET_NAME, f"models/{versioned_name}", tflite_path)
+            print(f"✅ Uploaded {versioned_name}")
+
+            safe_upload(BUCKET_NAME, f"models/{latest_name}", tflite_path)
+            print(f"✅ Uploaded {latest_name} (overwritten)")
+
+            # Keep only last 5 versions
+            if len(versions) >= 5:
+                versions_sorted = sorted(
+                    versions,
+                    key=lambda x: int(x.replace("final_model_v", "").replace(".tflite", ""))
+                )
+                to_delete = versions_sorted[:-5]
+                for old in to_delete:
+                    supabase.storage.from_(BUCKET_NAME).remove([f"models/{old}"])
+                    print(f"🗑️ Removed old version {old}")
+
+        # ---------------- Log metadata in Supabase ----------------
+        if next_version is not None and versioned_name is not None:
+            log_model_metadata(next_version, versioned_name, float(student_acc), class_metrics)
+            print(f"📊 Logged metadata for v{next_version}")
+
+    except Exception as e:
+        print(f"❌ Upload failed: {e}")
+
+    return next_version
+
+#  def upload_model_and_labels(student_acc, class_metrics):
+#     """Upload TFLite, H5 models, labels, and dataset.hash to Supabase Storage with versioning and cleanup."""
+#     next_version = None
+#     try:
+#         # 📂 Upload labels
+#         for labels_file in ["labels_full.txt", "labels.txt"]:
+#             path = os.path.join(MODEL_DIR, labels_file)
+#             if os.path.exists(path):
+#                 safe_upload(
+#                     BUCKET_NAME,
+#                     f"models/{labels_file}",
+#                     path,
+#                     content_type="text/plain"
+#                 )
+#                 print(f"✅ Uploaded {labels_file}")
+
+#         # 📂 Upload dataset.hash
+#         if os.path.exists(HASH_PATH):
+#             safe_upload(BUCKET_NAME, "models/dataset.hash", HASH_PATH, content_type="text/plain")
+#             print("✅ Uploaded dataset.hash")
+
+       
+#         # 📂 Upload TFLite model with versioning
+#         tflite_path = os.path.join(MODEL_DIR, "final_model.tflite")
+#         existing = supabase.storage.from_(BUCKET_NAME).list("models")
+#         versions = [f["name"] for f in existing if f["name"].startswith("final_model_v")]
+#         next_version = len(versions) + 1
+
+#         versioned_name = f"final_model_v{next_version}.tflite"
+#         latest_name = "final_model_latest.tflite"
+
+#         safe_upload(BUCKET_NAME, f"models/{versioned_name}", tflite_path)
+#         print(f"✅ Uploaded {versioned_name}")
+
+#         safe_upload(BUCKET_NAME, f"models/{latest_name}", tflite_path)
+#         print(f"✅ Uploaded {latest_name} (overwritten)")
+
+#         # 🧹 Cleanup (keep last 5 versions)
+#         if len(versions) >= 5:
+#             versions_sorted = sorted(
+#                 versions,
+#                 key=lambda x: int(x.replace("final_model_v", "").replace(".tflite", ""))
+#             )
+#             to_delete = versions_sorted[:-5]
+#             for old in to_delete:
+#                 supabase.storage.from_(BUCKET_NAME).remove([f"models/{old}"])
+#                 print(f"🗑️ Removed old version {old}")
+
+#         # 📝 Log in DB
+#         log_model_metadata(next_version, versioned_name, float(student_acc), class_metrics)
+#         print(f"📊 Logged metadata for v{next_version}")
+
+#        # 📂 Upload compressed teacher_model.h5 and final_model.h5
+#         for model_file in ["teacher_model.h5", "final_model.h5"]:
+#             path = os.path.join(MODEL_DIR, model_file)
+#             if os.path.exists(path):
+#                 compressed_path = path + ".gz"
+#                 # Compress the .h5 file
+#                 with open(path, 'rb') as f_in, gzip.open(compressed_path, 'wb') as f_out:
+#                     shutil.copyfileobj(f_in, f_out)
+#                 # Upload the compressed file
+#                 safe_upload(BUCKET_NAME, f"models/{model_file}.gz", compressed_path, content_type="application/gzip")
+#                 print(f"✅ Uploaded {model_file} as {model_file}.gz")
+#                 # Optionally, remove the compressed file after upload
+#                 os.remove(compressed_path)
+
+#     except Exception as e:
+#         print(f"❌ Upload failed: {e}")
+
+#     return next_version
 
 # ========= Utilities =========
 def compute_dataset_hash(directory: str) -> str:
@@ -250,7 +524,7 @@ class Distiller(tf.keras.Model):
         loss = self.student_loss_fn(y, preds, sample_weight)
         acc = tf.reduce_mean(tf.cast(tf.equal(tf.argmax(preds, axis=1), tf.argmax(y, axis=1)), tf.float32))
         self.compiled_metrics.update_state(y, preds, sample_weight)
-        return {"val_loss": loss, "val_accuracy": acc}
+        return {"loss": loss, "accuracy": acc}
 
     def _unpack_data(self, data):
         if isinstance(data, (tuple, list)):
@@ -281,6 +555,9 @@ class SaveBestStudent(Callback):
 # ========= Training =========
 def train_model():
     os.makedirs(MODEL_DIR, exist_ok=True)
+
+    download_models()
+
     print("🔄 Syncing training images from Supabase...")
     new_files = download_images()
 
@@ -335,7 +612,7 @@ def train_model():
         compute_class_weight("balanced", classes=np.unique(all_labels), y=all_labels)
     ))
 
-    history1, history2 = None, None
+    
     model = None
 
     # ---------- Incremental Training with Distillation ----------
@@ -354,22 +631,83 @@ def train_model():
         f.write(new_hash)
     print(f"💾 Saved student as FINAL_MODEL_PATH: {FINAL_MODEL_PATH}")
 
+   
     # Export TFLite
-    export_tflite(FINAL_MODEL_PATH)
+    if os.path.exists(BEST_PATH):
+        export_tflite(BEST_PATH)
+    else:
+        export_tflite(FINAL_MODEL_PATH)
 
     # Plot training curves
-    plot_training(history1, history2)
+    # plot_training(history1, history2)
 
     # Evaluate per-class metrics
-    evaluate_model(model, val_gen)
+    student_acc, metrics = evaluate_model(model, val_gen)
 
-    # Cleanup temp dataset
-    if os.path.exists(NEW_ONLY_DIR):
-        shutil.rmtree(NEW_ONLY_DIR)
-        print("🧹 Cleaned new-only dataset.")
+
+    # Upload + log to Supabase
+    upload_model_and_labels(student_acc, metrics)
+
+    # ---------------- Update metadata.json in Supabase ----------------
+    # update_metadata_json()
+
+   
+    # Cleanup temporary datasets and models
+    clean_directories()
 
     return True
 
+
+
+def clean_directories():
+    # Completely remove NEW_ONLY_DIR
+    if os.path.exists(NEW_ONLY_DIR):
+        shutil.rmtree(NEW_ONLY_DIR)
+        print(f"🧹 Cleaned directory: {NEW_ONLY_DIR}")
+
+    # Remove only specific files in MODEL_DIR
+    # if os.path.exists(MODEL_DIR):
+    #     for file_name in os.listdir(MODEL_DIR):
+    #         file_path = os.path.join(MODEL_DIR, file_name)
+    #         if (
+    #             file_name in ["dataset.hash", "labels_full.txt", "labels.txt"]
+    #             or file_name.endswith(".tflite")
+    #         ):
+    #             try:
+    #                 os.remove(file_path)
+    #                 print(f"🧹 Removed file: {file_path}")
+    #             except Exception as e:
+    #                 print(f"❌ Failed to remove {file_path}: {e}")
+
+    # if os.path.exists(DATA_DIR):
+    #     for file_name in os.listdir(DATA_DIR):
+    #         file_path = os.path.join(DATA_DIR, file_name)
+    #         if file_name.endswith(".json"):
+    #             try:
+    #                 os.remove(file_path)
+    #                 print(f"🧹 Removed file: {file_path}")
+    #             except Exception as e:
+    #                 print(f"❌ Failed to remove {file_path}: {e}")
+
+    return True
+
+
+
+# ========= Update Supabase metadata =========
+# def update_metadata_json():
+#     """Save current dataset snapshot to Supabase as _downloaded_metadata.json."""
+#     metadata = {}
+#     for root, _, files in os.walk(DATA_DIR):
+#         for f in files:
+#             if f.lower().endswith(AUG_EXTS):
+#                 path = os.path.join(root, f)
+#                 rel_path = os.path.relpath(path, DATA_DIR)
+#                 metadata[rel_path] = os.path.getsize(path)
+
+#     local_path = METADATA_FILE
+    
+#     safe_upload(BUCKET_NAME, local_path, local_path, "application/json")
+#     print(f"🗂️ Updated _downloaded_metadata.json in Supabase with {len(metadata)} entries")
 
 # ========= Helper functions for modular training =========
 def incremental_distillation(dataset_path, class_indices, class_weights, new_files):
@@ -417,8 +755,14 @@ def incremental_distillation(dataset_path, class_indices, class_weights, new_fil
         student_loss_fn=tf.keras.losses.CategoricalCrossentropy(),
         distillation_loss_fn=tf.keras.losses.KLDivergence()
     )
+
     distiller.fit(train_gen, validation_data=val_gen, epochs=FINE_TUNE_EPOCHS, class_weight=class_weights,
-                  callbacks=[EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)])
+                  callbacks=[EarlyStopping(monitor="val_accuracy", mode="max", patience=5, restore_best_weights=True) , 
+                    SaveBestStudent(
+                            student=student,
+                            best_path=BEST_PATH
+                        )
+                  ])
     return student
 
 
@@ -469,7 +813,11 @@ def cold_start_teacher(data_dir, class_weights):
                       distillation_loss_fn=tf.keras.losses.KLDivergence())
     distiller.fit(train_gen, validation_data=val_gen, epochs=FINE_TUNE_EPOCHS,
                   class_weight=dict(enumerate(compute_class_weight("balanced", classes=np.unique(train_gen.classes), y=train_gen.classes))),
-                  callbacks=[EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)])
+                  
+                  callbacks=[EarlyStopping(monitor="val_accuracy", mode="max", patience=5, restore_best_weights=True), 
+                    SaveBestStudent(student=student,best_path=BEST_PATH)
+                  ])
+    
     return student
 
 
@@ -504,16 +852,34 @@ def plot_training(history1, history2=None):
     plt.legend()
     plt.show()
 
-
+# ========= Evaluation =========
 def evaluate_model(model, val_gen):
+    # """Compute per-class metrics and save to CSV."""
+    # y_true = val_gen.classes
+    # y_pred = np.argmax(model.predict(val_gen), axis=1)
+    # labels = list(val_gen.class_indices.keys())
+    # precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, zero_division=0)
+    # cm = confusion_matrix(y_true, y_pred)
+    # ConfusionMatrixDisplay(cm, display_labels=labels).plot()
+    # plt.show()
+
+    # with open(PER_CLASS_CSV, "w", newline="") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(["class", "precision", "recall", "f1-score"])
+    #     for i, cls in enumerate(labels):
+    #         writer.writerow([cls, precision[i], recall[i], f1[i]])
+    # print(f"📊 Per-class metrics saved -> {PER_CLASS_CSV}")
     """Compute per-class metrics and save to CSV."""
     y_true = val_gen.classes
     y_pred = np.argmax(model.predict(val_gen), axis=1)
     labels = list(val_gen.class_indices.keys())
+
+
     precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, zero_division=0)
     cm = confusion_matrix(y_true, y_pred)
     ConfusionMatrixDisplay(cm, display_labels=labels).plot()
     plt.show()
+
 
     with open(PER_CLASS_CSV, "w", newline="") as f:
         writer = csv.writer(f)
@@ -521,6 +887,15 @@ def evaluate_model(model, val_gen):
         for i, cls in enumerate(labels):
             writer.writerow([cls, precision[i], recall[i], f1[i]])
     print(f"📊 Per-class metrics saved -> {PER_CLASS_CSV}")
+
+
+    # Compute global accuracy
+    acc = np.mean(y_true == y_pred)
+    # Convert metrics to dict for Supabase
+    metrics_dict = {cls: {"precision": float(precision[i]), "recall": float(recall[i]), "f1": float(f1[i])} for i, cls in enumerate(labels)}
+
+
+    return acc, metrics_dict
 
 
 
